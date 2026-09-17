@@ -122,8 +122,9 @@ jobs:
       # ========================================================================
       - name: Generate CycloneDX SBOM with Trivy
         if: github.event_name != 'pull_request'
-        uses: aquasecurity/trivy-action@18f2510ee396bbf400402947b394f2dd8c87dbb0 # v0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
+          scan-type: 'image'
           image-ref: ${{ steps.target-name.outputs.full_image }}@${{ steps.build-push.outputs.digest }}
           format: 'cyclonedx'
           output: '${{ matrix.name }}-sbom.cdx.json'
@@ -133,8 +134,9 @@ jobs:
 
       - name: Run Trivy Vulnerability Scanner (Quality Gate & SARIF)
         if: github.event_name != 'pull_request'
-        uses: aquasecurity/trivy-action@18f2510ee396bbf400402947b394f2dd8c87dbb0 # v0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
+          scan-type: 'image'
           image-ref: ${{ steps.target-name.outputs.full_image }}@${{ steps.build-push.outputs.digest }}
           format: 'sarif'
           output: '${{ matrix.name }}-trivy-results.sarif'
