@@ -1,0 +1,182 @@
+# Copyright 2026 Chainguard, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Kaniko Build, Scan & Deploy
+
+on:
+  push:
+    branches:
+      - 'main'
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - 'main'
+  workflow_dispatch:
+  schedule:
+    # Audit hebdomadaire Zero-Day pour détecter les nouvelles CVE (Dimanche à 03:00 UTC)
+    - cron: '0 3 * * 0'
+
+permissions:
+  contents: read
+
+jobs:
+  # ============================================================================
+  # 1. BUILD & PACKAGE (Docker Buildx Multi-Arch)
+  # ============================================================================
+  build-and-push:
+    name: Build & Push (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      security-events: write
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: kaniko-executor
+            name: executor
+            image-suffix: ""
+            platforms: linux/amd64,linux/arm64
+          - target: kaniko-debug
+            name: executor-debug
+            image-suffix: "-debug"
+            platforms: linux/amd64,linux/arm64
+          - target: kaniko-slim
+            name: executor-slim
+            image-suffix: "-slim"
+            platforms: linux/amd64,linux/arm64
+          - target: kaniko-warmer
+            name: warmer
+            image-suffix: "-warmer"
+            platforms: linux/amd64,linux/arm64
+
+    env:
+      REGISTRY: ghcr.io
+      BASE_IMAGE_NAME: ${{ github.repository_owner }}/kaniko
+
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          egress-policy: audit
+
+      - name: Checkout Repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+        with:
+          platforms: ${{ matrix.platforms }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Determine Target Image Full Name
+        id: target-name
+        run: |
+          FULL_IMAGE="${{ env.REGISTRY }}/${{ env.BASE_IMAGE_NAME }}/${{ matrix.name }}"
+          echo "full_image=${FULL_IMAGE}" >> $GITHUB_OUTPUT
+
+      - name: Extract Docker Metadata & Tags
+        id: meta
+        uses: docker/metadata-action@8e5442c4ef9f78752691e2d8f8d19755c6f78e81 # v5.5.1
+        with:
+          images: ${{ steps.target-name.outputs.full_image }}
+          tags: |
+            type=sha,prefix=,format=short
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Log in to GitHub Container Registry (GHCR)
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Build multi-plateforme et push de l'image candidate
+      - name: Build and Push Docker Image
+        id: build-push
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: ./deploy/Dockerfile
+          target: ${{ matrix.target }}
+          platforms: ${{ matrix.platforms }}
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ========================================================================
+      # 2. SECURITY SCAN (Trivy SARIF + CycloneDX SBOM)
+      # ========================================================================
+      - name: Generate CycloneDX SBOM with Trivy
+        if: github.event_name != 'pull_request'
+        uses: aquasecurity/trivy-action@18f2510ee396bbf400402947b394f2dd8c87dbb0 # v0.28.0
+        with:
+          image-ref: ${{ steps.target-name.outputs.full_image }}@${{ steps.build-push.outputs.digest }}
+          format: 'cyclonedx'
+          output: '${{ matrix.name }}-sbom.cdx.json'
+        env:
+          TRIVY_USERNAME: ${{ github.actor }}
+          TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run Trivy Vulnerability Scanner (Quality Gate & SARIF)
+        if: github.event_name != 'pull_request'
+        uses: aquasecurity/trivy-action@18f2510ee396bbf400402947b394f2dd8c87dbb0 # v0.28.0
+        with:
+          image-ref: ${{ steps.target-name.outputs.full_image }}@${{ steps.build-push.outputs.digest }}
+          format: 'sarif'
+          output: '${{ matrix.name }}-trivy-results.sarif'
+          severity: 'HIGH,CRITICAL'
+          ignore-unfixed: true
+          exit-code: '1'
+        env:
+          TRIVY_USERNAME: ${{ github.actor }}
+          TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload Scan Results to GitHub Security (SARIF)
+        if: always() && github.event_name != 'pull_request'
+        uses: github/codeql-action/upload-sarif@b56ba49b26e50535fa1e7f7db0f4f7b4bf65d80d # v3.28.10
+        with:
+          sarif_file: '${{ matrix.name }}-trivy-results.sarif'
+          category: 'trivy-${{ matrix.name }}'
+
+      - name: Archive CycloneDX SBOM Artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.1
+        with:
+          name: ${{ matrix.name }}-sbom
+          path: ${{ matrix.name }}-sbom.cdx.json
+
+      # ========================================================================
+      # 3. SIGN & ATTEST (Sigstore Cosign Keyless OIDC)
+      # ========================================================================
+      - name: Install Sigstore Cosign
+        if: github.event_name != 'pull_request'
+        uses: sigstore/cosign-installer@dc72c7d5c4d10cd6bcb8cf6e3fd625a9e5e537da # v3.7.0
+
+      - name: Sign Image Digest (Keyless via GitHub OIDC)
+        if: github.event_name != 'pull_request'
+        run: |
+          echo "Signature cryptographique par digest : ${{ steps.target-name.outputs.full_image }}@${{ steps.build-push.outputs.digest }}"
+          cosign sign --yes "${{ steps.target-name.outputs.full_image }}@${{ steps.build-push.outputs.digest }}"
+
+      - name: Attest CycloneDX SBOM to Container Image
+        if: github.event_name != 'pull_request'
+        run: |
+          echo "Attestation du SBOM CycloneDX sur l'image : ${{ steps.target-name.outputs.full_image }}@${{ steps.build-push.outputs.digest }}"
+          cosign attest --yes \
+            --predicate "${{ matrix.name }}-sbom.cdx.json" \
+            --type cyclonedx \
+            "${{ steps.target-name.outputs.full_image }}@${{ steps.build-push.outputs.digest }}"
